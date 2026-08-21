@@ -14,11 +14,21 @@ permissions:
   contents: read          # minimum needed to checkout the repo
   checks: write           # allows test-reporter to post results
   pull-requests: write    # allows test-reporter to post PR comments
+  security-events: write  # allows Snyk to upload SARIF to GitHub Code Scanning
+
+# ── Workflow-level variables ────────────────────────────────────────────────
+# Non-sensitive configuration values shared across jobs.
+# Change SONAR_HOST_URL here if you switch from SonarCloud to a self-hosted
+# SonarQube instance (e.g. https://sonar.mycompany.com) — no step edits needed.
+env:
+  SONAR_HOST_URL: https://sonarcloud.io
 
 jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — Build & Test
+  # ────────────────────────────────────────────────────────────────────────────
   build:
     name: Build & Test (Java 21)
-    # GitHub-hosted runner — ubuntu-latest is free for public repos
     runs-on: ubuntu-latest
 
     steps:
@@ -72,3 +82,186 @@ jobs:
           path: target/surefire-reports/*.xml
           reporter: java-junit
           fail-on-error: false          # don't fail the step; the build step already handles this
+
+      # ── 8. Cache the full Maven local repository for security jobs ─────────
+      #       Both sonarqube and snyk jobs need compiled classes; sharing the
+      #       ~/.m2 cache avoids a full re-download on every parallel runner.
+      - name: Cache Maven local repository for downstream jobs
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+
+      # ── 9. Share compiled target/ dir with downstream security jobs ────────
+      - name: Upload build target for security scans
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-target
+          # Include compiled classes, generated sources, and JaCoCo XML so
+          # SonarQube can read coverage data without re-running tests.
+          path: |
+            target/classes
+            target/generated-sources
+            target/site/jacoco/jacoco.xml
+            pom.xml
+          retention-days: 1             # short-lived — only needed within the run
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2 — SonarQube analysis  (runs in PARALLEL with snyk after build)
+  # Required secrets (GitHub → Settings → Secrets → Actions):
+  #   SONAR_TOKEN  — project analysis token from https://sonarcloud.io/account/security
+  # ────────────────────────────────────────────────────────────────────────────
+  sonarqube:
+    name: SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: build                        # wait for build to succeed first
+
+    steps:
+      # ── 1. Checkout (SonarQube scanner needs full SCM history for blame) ───
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                # full history required for blame/new-code detection
+
+      # ── 2. Set up Java 21 ─────────────────────────────────────────────────
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # ── 3. Restore the Maven local repository saved by the build job ───────
+      - name: Restore Maven local repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+
+      # ── 4. Download compiled classes + JaCoCo report from build job ─────────
+      - name: Download build target artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-target
+          # Restore into the same relative paths the Maven build would produce
+          path: .
+
+      # ── 5. Run SonarQube scanner via the Maven plugin ──────────────────────
+      #       sonar:sonar is a lightweight goal — it does NOT recompile or
+      #       rerun tests; it reads already-generated .class files and the
+      #       JaCoCo XML coverage report produced by the build job.
+      #
+      #       SONAR_TOKEN  → GitHub secret (sensitive, never logged).
+      #       SONAR_HOST_URL → workflow-level env var (top of this file);
+      #                        change it there to point at a self-hosted instance.
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          ./mvnw -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4882:sonar \
+            --no-transfer-progress \
+            -Dsonar.projectKey=spring-petclinic-rest \
+            -Dsonar.projectName="Spring PetClinic REST" \
+            -Dsonar.host.url="${{ env.SONAR_HOST_URL }}" \
+            -Dsonar.token="${SONAR_TOKEN}" \
+            -Dsonar.java.binaries=target/classes \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.sources=src/main/java \
+            -Dsonar.tests=src/test/java \
+            -Dsonar.exclusions="**/rest/dto/**,**/rest/api/**" \
+            -Dsonar.scm.provider=git
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3 — Snyk security scan  (runs in PARALLEL with sonarqube after build)
+  # Required secrets:
+  #   SNYK_TOKEN — API token from https://app.snyk.io/account (User Settings)
+  # ────────────────────────────────────────────────────────────────────────────
+  snyk:
+    name: Snyk Security Scan
+    runs-on: ubuntu-latest
+    needs: build                        # wait for build to succeed first
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Java 21 ─────────────────────────────────────────────────
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # ── 3. Set up Node.js for Snyk CLI ────────────────────────────────────
+      #       Snyk CLI is distributed via npm; pin the Node LTS major version.
+      - name: Set up Node.js (for Snyk CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'            # LTS; pinned major to avoid surprise upgrades
+
+      # ── 4. Install Snyk CLI at a pinned version (supply-chain safety) ──────
+      - name: Install Snyk CLI
+        run: npm install --global snyk@1.1295.1
+
+      # ── 5. Restore the Maven local repository saved by the build job ───────
+      - name: Restore Maven local repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+
+      # ── 6. Authenticate Snyk via secret token (never logged, never stored) ─
+      - name: Authenticate Snyk
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: snyk auth "${SNYK_TOKEN}"
+
+      # ── 7. Run Snyk open-source (dependency) vulnerability scan ────────────
+      #       --all-projects  scans every Maven module in the repo
+      #       --severity-threshold=high  only fail on High/Critical findings
+      #       continue-on-error lets the SARIF upload step always run
+      - name: Snyk dependency vulnerability test
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk test \
+            --all-projects \
+            --severity-threshold=high \
+            --json-file-output=snyk-results.json
+        continue-on-error: true         # capture SARIF even when vulnerabilities are found
+
+      # ── 8. Convert Snyk JSON results to SARIF format ───────────────────────
+      - name: Convert Snyk results to SARIF
+        if: always()
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk test \
+            --all-projects \
+            --severity-threshold=high \
+            --sarif-file-output=snyk.sarif || true
+
+      # ── 9. Upload SARIF report to GitHub Code Scanning ─────────────────────
+      #       Findings appear in Security → Code scanning alerts on the repo.
+      #       Runs even when snyk test exits non-zero (vulnerabilities found).
+      - name: Upload Snyk SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-oss           # groups results under a named tool category
+
+      # ── 10. Upload raw Snyk JSON report as a workflow artifact ─────────────
+      - name: Upload Snyk JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-results
+          path: snyk-results.json
+          retention-days: 14
