@@ -1,0 +1,74 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+      - 'fix/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read          # minimum needed to checkout the repo
+  checks: write           # allows test-reporter to post results
+  pull-requests: write    # allows test-reporter to post PR comments
+
+jobs:
+  build:
+    name: Build & Test (Java 21)
+    # GitHub-hosted runner — ubuntu-latest is free for public repos
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Java 21 (matches spring-boot-starter-parent 4.1.0) ──────
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'        # Eclipse Temurin — free, reputable build
+          cache: 'maven'                 # caches ~/.m2 between runs
+
+      # ── 3. Validate Maven wrapper checksum (supply-chain safety) ───────────
+      - name: Validate Maven wrapper
+        uses: s4u/maven-wrapper-action@v1.0.0
+
+      # ── 4. Build, run tests, enforce coverage thresholds ──────────────────
+      #       -B            = batch/non-interactive mode (no colour codes)
+      #       verify        = compile + test + jacoco:check + jacoco:report
+      #       --no-transfer-progress = cleaner CI logs
+      - name: Build and verify
+        run: ./mvnw -B verify --no-transfer-progress
+
+      # ── 5. Publish JaCoCo XML coverage report as a workflow summary ────────
+      - name: Upload JaCoCo XML report
+        if: always()                    # upload even when tests fail
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/jacoco.xml
+          retention-days: 14
+
+      # ── 6. Upload the packaged JAR so it can be downloaded from the run ───
+      - name: Upload application JAR
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: petclinic-rest-jar
+          path: target/*.jar
+          retention-days: 7
+
+      # ── 7. Publish Surefire (JUnit) test results in the Actions UI ─────────
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: JUnit Test Results
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false          # don't fail the step; the build step already handles this
