@@ -12,6 +12,7 @@ import org.springframework.security.config.annotation.web.configurers.AbstractHt
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.servlet.util.matcher.PathPatternRequestMatcher;
 
 import javax.sql.DataSource;
 
@@ -36,6 +37,9 @@ public class BasicAuthenticationConfig {
         http
             .csrf(AbstractHttpConfigurer::disable)
             .authorizeHttpRequests((authz) -> authz
+                // Allow Prometheus scraper to reach the metrics endpoint without credentials.
+                // All other requests still require authentication.
+                .requestMatchers(PathPatternRequestMatcher.withDefaults().matcher("/actuator/prometheus")).permitAll()
                 .anyRequest().authenticated())
                 .httpBasic(Customizer.withDefaults());
         // @formatter:on

@@ -24,3 +24,50 @@ services:
       - POSTGRES_DB=petclinic
     profiles:
       - postgres
+
+  # --------------------------------------------------------------------------
+  # Observability stack — Prometheus + Grafana
+  # Start with:  docker-compose --profile observability up
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    container_name: petclinic-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      # Mount our scrape config into the container
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # Keep 15 days of data locally
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    extra_hosts:
+      # Makes host.docker.internal resolve to the host machine on ALL platforms:
+      # - Linux Docker Engine (no built-in host.docker.internal)
+      # - Docker Desktop Mac/Windows (already works, this is a safe no-op)
+      # "host-gateway" is a Docker Compose magic value — never an IP, always portable
+      - "host.docker.internal:host-gateway"
+    profiles:
+      - observability
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: petclinic-grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    environment:
+      # Anonymous access — anyone can view dashboards as Admin, no login needed
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      # Organisation display name
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+    volumes:
+      # Auto-provision the Prometheus datasource and dashboard provider
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+    profiles:
+      - observability

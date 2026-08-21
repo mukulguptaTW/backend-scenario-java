@@ -1,0 +1,30 @@
+global:
+  # How frequently Prometheus scrapes targets by default
+  scrape_interval: 15s
+  # How frequently Prometheus evaluates alerting rules
+  evaluation_interval: 15s
+
+scrape_configs:
+
+  # ------------------------------------------------------------------
+  # Scrape Prometheus itself
+  # ------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: [ "localhost:9090" ]
+
+  # ------------------------------------------------------------------
+  # Scrape the PetClinic Spring Boot API
+  #
+  # host.docker.internal  →  resolves to the Mac host from inside Docker
+  # 9966                  →  the port Spring Boot listens on
+  # /petclinic/actuator/prometheus  →  the Micrometer scrape endpoint
+  # ------------------------------------------------------------------
+  - job_name: petclinic-rest
+    metrics_path: /petclinic/actuator/prometheus
+    static_configs:
+      - targets: [ "host.docker.internal:9966" ]
+    # Label every scraped sample with the environment name
+    relabel_configs:
+      - target_label: environment
+        replacement: local
