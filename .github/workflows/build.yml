@@ -266,3 +266,106 @@ jobs:
           name: snyk-results
           path: snyk-results.json
           retention-days: 14
+
+      # ── 11. Publish Snyk Security Summary to GitHub Job Summary ────────────
+      #        Writes a rich Markdown report to the Actions "Summary" tab.
+      #        Handles missing/malformed JSON gracefully — never exposes secrets.
+      - name: Publish Snyk Security Summary
+        if: always()
+        run: |
+          RESULTS_FILE="snyk-results.json"
+          SUMMARY_FILE="${GITHUB_STEP_SUMMARY}"
+
+          # ── Helper: write a line to the summary ─────────────────────────────
+          summary() { printf '%s\n' "$*" >> "${SUMMARY_FILE}"; }
+
+          summary "## 🔐 Snyk Security Scan Results"
+          summary ""
+          summary "| Detail        | Value |"
+          summary "|---------------|-------|"
+          summary "| **Branch**    | \`${{ github.ref_name }}\` |"
+          summary "| **Commit**    | \`${{ github.sha }}\` |"
+          summary "| **Triggered** | ${{ github.event_name }} |"
+          summary "| **Snyk CLI**  | $(snyk --version 2>/dev/null || echo 'unknown') |"
+          summary ""
+
+          # ── Guard: check the results file exists and is valid JSON ───────────
+          if [ ! -f "${RESULTS_FILE}" ]; then
+            summary "> ⚠️ **\`snyk-results.json\` was not found.** The scan may have failed before producing output."
+            exit 0
+          fi
+
+          if ! jq empty "${RESULTS_FILE}" 2>/dev/null; then
+            summary "> ⚠️ **\`snyk-results.json\` contains invalid JSON.** Cannot parse results."
+            exit 0
+          fi
+
+          # ── Normalise: snyk --all-projects outputs an array; single project  ─
+          # outputs an object. Wrap object in array so downstream jq is uniform.
+          NORMALISED=$(jq 'if type == "array" then . else [.] end' "${RESULTS_FILE}")
+
+          # ── Count vulnerabilities by severity across ALL projects ────────────
+          COUNT_CRITICAL=$(echo "${NORMALISED}" | jq '[.[].vulnerabilities[]? | select(.severity=="critical")] | length')
+          COUNT_HIGH=$(echo     "${NORMALISED}" | jq '[.[].vulnerabilities[]? | select(.severity=="high")]     | length')
+          COUNT_MEDIUM=$(echo   "${NORMALISED}" | jq '[.[].vulnerabilities[]? | select(.severity=="medium")]   | length')
+          COUNT_LOW=$(echo      "${NORMALISED}" | jq '[.[].vulnerabilities[]? | select(.severity=="low")]      | length')
+          COUNT_TOTAL=$(echo    "${NORMALISED}" | jq '[.[].vulnerabilities[]?] | length')
+
+          # ── Overall pass/fail badge ──────────────────────────────────────────
+          if [ "${COUNT_CRITICAL}" -gt 0 ] || [ "${COUNT_HIGH}" -gt 0 ]; then
+            summary "### ❌ Status: FAILED — Critical or High vulnerabilities detected"
+          else
+            summary "### ✅ Status: PASSED — No Critical or High vulnerabilities found"
+          fi
+          summary ""
+
+          # ── Severity summary table ───────────────────────────────────────────
+          summary "### 📊 Vulnerability Summary"
+          summary ""
+          summary "| Severity     | Count |"
+          summary "|:-------------|------:|"
+          summary "| 🔴 Critical  | ${COUNT_CRITICAL} |"
+          summary "| 🟠 High      | ${COUNT_HIGH} |"
+          summary "| 🟡 Medium    | ${COUNT_MEDIUM} |"
+          summary "| 🔵 Low       | ${COUNT_LOW} |"
+          summary "| **Total**    | **${COUNT_TOTAL}** |"
+          summary ""
+
+          # ── Top-10 findings detail table (Critical → High → Medium → Low) ───
+          summary "### 🔎 Top Findings (up to 10, sorted by severity)"
+          summary ""
+          summary "| # | Severity | Package | Installed Version | Fixed In | Title |"
+          summary "|---|:---------|:--------|:------------------|:---------|:------|"
+
+          echo "${NORMALISED}" | jq -r '
+            [ .[].vulnerabilities[]?
+              | {
+                  sev:     .severity,
+                  pkg:     (.packageName // "n/a"),
+                  ver:     (.version    // "n/a"),
+                  fix:     (if (.fixedIn | length) > 0 then (.fixedIn | join(", ")) else "No fix available" end),
+                  title:   (.title      // "n/a")
+                }
+            ]
+            | sort_by(
+                if   .sev=="critical" then 0
+                elif .sev=="high"     then 1
+                elif .sev=="medium"   then 2
+                else 3 end
+              )
+            | .[:10][]
+            | [.sev, .pkg, .ver, .fix, .title]
+            | @tsv
+          ' | awk -F'\t' 'BEGIN{i=1} {
+              sev=$1; pkg=$2; ver=$3; fix=$4; title=$5
+              emoji="🔵"
+              if (sev=="critical") emoji="🔴"
+              else if (sev=="high") emoji="🟠"
+              else if (sev=="medium") emoji="🟡"
+              printf "| %d | %s %s | `%s` | `%s` | %s | %s |\n", i++, emoji, sev, pkg, ver, fix, title
+          }' >> "${SUMMARY_FILE}"
+
+          summary ""
+          summary "---"
+          summary "> 📦 **Full report:** Download the \`snyk-results\` artifact from the **Artifacts** section of this workflow run for the complete JSON output."
+          summary "> 🔍 **Code Scanning:** Detailed findings are also available under **Security → Code scanning alerts** (SARIF upload)."
