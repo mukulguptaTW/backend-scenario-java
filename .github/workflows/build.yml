@@ -161,7 +161,7 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         run: |
-          ./mvnw -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4882:sonar \
+          ./mvnw -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar \
             --no-transfer-progress \
             -Dsonar.projectKey=spring-petclinic-rest \
             -Dsonar.projectName="Spring PetClinic REST" \
