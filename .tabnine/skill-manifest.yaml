@@ -1,0 +1,16 @@
+skills:
+  - name: secrets-scanner
+    path: .tabnine/skills/secrets-scanner.md
+    trigger: "Use the secrets-scanner skill to scan this repo"
+    description: >
+      Checks whether gitleaks is installed (installs via Homebrew on macOS or
+      apt-get on Linux if missing), then scans the entire repository for
+      committed secrets. Saves the full findings report to gitleaks-report.json
+      and prints a redacted summary showing file, line, rule ID, and commit SHA
+      — never the actual secret values. Provides remediation guidance for each
+      finding.
+    tags:
+      - security
+      - secrets
+      - gitleaks
+      - devSecOps
