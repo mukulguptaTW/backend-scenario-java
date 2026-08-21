@@ -166,7 +166,7 @@ jobs:
         run: |
           ./mvnw -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar \
             --no-transfer-progress \
-            -Dsonar.projectKey=spring-petclinic-rest \
+            -Dsonar.projectKey=spring-petclinic-rest1 \
             -Dsonar.projectName="Spring PetClinic REST" \
             -Dsonar.organization="${{ env.SONAR_ORGANIZATION }}" \
             -Dsonar.host.url="${{ env.SONAR_HOST_URL }}" \
