@@ -183,6 +183,12 @@ jobs:
     name: Snyk Security Scan
     runs-on: ubuntu-latest
     needs: build                        # wait for build to succeed first
+    # ── Job-level env: SNYK_TOKEN is read natively by the Snyk CLI ───────────
+    # This is the correct CI authentication pattern — no `snyk auth` command
+    # needed. The CLI detects SNYK_TOKEN automatically on every step,
+    # so the token is never logged or passed as a CLI argument.
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
       # ── 1. Checkout ────────────────────────────────────────────────────────
@@ -216,19 +222,12 @@ jobs:
           key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
           restore-keys: maven-${{ runner.os }}-
 
-      # ── 6. Authenticate Snyk via secret token (never logged, never stored) ─
-      - name: Authenticate Snyk
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: snyk auth "${SNYK_TOKEN}"
-
-      # ── 7. Run Snyk open-source (dependency) vulnerability scan ────────────
+      # ── 6. Run Snyk open-source (dependency) vulnerability scan ────────────
+      #       SNYK_TOKEN is picked up automatically from the job-level env block.
       #       --all-projects  scans every Maven module in the repo
       #       --severity-threshold=high  only fail on High/Critical findings
       #       continue-on-error lets the SARIF upload step always run
       - name: Snyk dependency vulnerability test
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           snyk test \
             --all-projects \
@@ -236,11 +235,9 @@ jobs:
             --json-file-output=snyk-results.json
         continue-on-error: true         # capture SARIF even when vulnerabilities are found
 
-      # ── 8. Convert Snyk JSON results to SARIF format ───────────────────────
+      # ── 7. Convert Snyk JSON results to SARIF format ───────────────────────
       - name: Convert Snyk results to SARIF
         if: always()
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         run: |
           snyk test \
             --all-projects \
