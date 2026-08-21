@@ -23,7 +23,7 @@ permissions:
 #                      Find it at: https://sonarcloud.io/account/organizations
 env:
   SONAR_HOST_URL: https://sonarcloud.io
-  SONAR_ORGANIZATION: mukulguptatws
+  SONAR_ORGANIZATION: mukulguptatw
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
