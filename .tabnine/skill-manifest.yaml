@@ -14,3 +14,19 @@ skills:
       - secrets
       - gitleaks
       - devSecOps
+  - name: snyk-cli-provisioner
+    path: .tabnine/skills/snyk-cli-provisioner.md
+    trigger: "Run the snyk-cli-provisioner skill"
+    description: >
+      Checks whether the Snyk CLI is installed and authenticated. Installs via
+      npm globally if missing. Guides through browser-based OAuth authentication
+      if not authenticated. Runs snyk test --json --all-projects and saves the
+      full dependency vulnerability report to snyk-report.json. Prints a
+      severity summary (Critical/High/Medium/Low) — never logs SNYK_TOKEN or
+      any credential value.
+    tags:
+      - security
+      - snyk
+      - dependencies
+      - vulnerabilities
+      - devSecOps

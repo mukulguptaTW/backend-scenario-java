@@ -27,3 +27,6 @@ springboot-petclinic-server/
 
 # Secrets scan report — contains secret metadata; must never be committed
 gitleaks-report.json
+
+# Snyk vulnerability report — contains sensitive dependency metadata; must never be committed
+snyk-report.json
