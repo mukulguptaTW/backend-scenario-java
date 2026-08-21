@@ -46,9 +46,16 @@ jobs:
           distribution: 'temurin'        # Eclipse Temurin — free, reputable build
           cache: 'maven'                 # caches ~/.m2 between runs
 
-      # ── 3. Validate Maven wrapper checksum (supply-chain safety) ───────────
-      - name: Validate Maven wrapper
-        run: ./mvnw --version --no-transfer-progress
+      # ── 3. Cache the Maven wrapper distribution (avoids 429 from Maven Central) ─
+      #       The wrapper downloads apache-maven-3.9.9-bin.zip on first run and
+      #       caches it under ~/.m2/wrapper. Subsequent runs restore from cache,
+      #       so ./mvnw never hits repo.maven.apache.org again.
+      - name: Cache Maven wrapper distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/wrapper
+          key: mvnw-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+          restore-keys: mvnw-${{ runner.os }}-
 
       # ── 4. Build, run tests, enforce coverage thresholds ──────────────────
       #       -B            = batch/non-interactive mode (no colour codes)
@@ -142,6 +149,14 @@ jobs:
           path: ~/.m2/repository
           key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
           restore-keys: maven-${{ runner.os }}-
+
+      # ── 3b. Restore Maven wrapper distribution (avoids 429 from Maven Central) ─
+      - name: Cache Maven wrapper distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/wrapper
+          key: mvnw-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+          restore-keys: mvnw-${{ runner.os }}-
 
       # ── 4. Download compiled classes + JaCoCo report from build job ─────────
       - name: Download build target artifact
