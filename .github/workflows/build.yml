@@ -18,10 +18,12 @@ permissions:
 
 # ── Workflow-level variables ────────────────────────────────────────────────
 # Non-sensitive configuration values shared across jobs.
-# Change SONAR_HOST_URL here if you switch from SonarCloud to a self-hosted
-# SonarQube instance (e.g. https://sonar.mycompany.com) — no step edits needed.
+# SONAR_HOST_URL    — change to your self-hosted URL if not using SonarCloud.
+# SONAR_ORGANIZATION — your SonarCloud organization key (GitHub username/org).
+#                      Find it at: https://sonarcloud.io/account/organizations
 env:
   SONAR_HOST_URL: https://sonarcloud.io
+  SONAR_ORGANIZATION: mukulguptaTW
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────────
@@ -154,9 +156,10 @@ jobs:
       #       rerun tests; it reads already-generated .class files and the
       #       JaCoCo XML coverage report produced by the build job.
       #
-      #       SONAR_TOKEN  → GitHub secret (sensitive, never logged).
-      #       SONAR_HOST_URL → workflow-level env var (top of this file);
-      #                        change it there to point at a self-hosted instance.
+      #       SONAR_TOKEN        → GitHub secret (sensitive, never logged).
+      #       SONAR_HOST_URL     → workflow-level env var (top of this file).
+      #       SONAR_ORGANIZATION → workflow-level env var (top of this file);
+      #                            must match your SonarCloud organization key.
       - name: Run SonarQube analysis
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -165,6 +168,7 @@ jobs:
             --no-transfer-progress \
             -Dsonar.projectKey=spring-petclinic-rest \
             -Dsonar.projectName="Spring PetClinic REST" \
+            -Dsonar.organization="${{ env.SONAR_ORGANIZATION }}" \
             -Dsonar.host.url="${{ env.SONAR_HOST_URL }}" \
             -Dsonar.token="${SONAR_TOKEN}" \
             -Dsonar.java.binaries=target/classes \
