@@ -426,59 +426,94 @@ jobs:
               | tee /tmp/pod-describe.txt || true
           fi
 
-      # ── 11. Full Validation — health, API smoke, Swagger UI ───────────────
+      # ── 11. Full Validation — health, API smoke, Swagger UI, Prometheus ────
+      # NOTE on Prometheus URL:
+      #   http://host.docker.internal:9966/petclinic/actuator/prometheus
+      #   ↑ This URL is for LOCAL docker-compose Prometheus scraping only.
+      #     host.docker.internal does NOT exist on GitHub Actions Linux runners.
+      #   In CI the app is reachable at http://localhost:9966/petclinic/... via
+      #   the KIND cluster extraPortMappings hostPort binding (listenAddress: 127.0.0.1).
       - name: Validate deployment — health + smoke tests
         id: validate
         run: |
           APP_URL="http://localhost:9966/petclinic"
 
-          echo "── Health Check ──────────────────────────────────────────────"
-          for i in $(seq 1 12); do
+          # ── Pre-flight: diagnose port binding on the runner ─────────────────
+          echo "── Runner Network Diagnostics ────────────────────────────────"
+          echo "--- Bound ports (port 9966) ---"
+          ss -tlnp 2>/dev/null | grep 9966 || echo "(9966 not yet bound — KIND node may still be starting)"
+          echo "--- Quick TCP probe on localhost:9966 ---"
+          curl -sv --max-time 3 "http://localhost:9966/" 2>&1 | head -20 || true
+          echo ""
+
+          # ── Health check — 24 retries × 5s = 120s max ──────────────────────
+          # Spring Boot with H2 init inside KIND on a cold runner can need ~90s.
+          echo "── Health Check (max 120s) ───────────────────────────────────"
+          HTTP_CODE="000"
+          for i in $(seq 1 24); do
             HTTP_CODE=$(curl -s -o /tmp/health.json -w "%{http_code}" \
-              "${APP_URL}/actuator/health" || echo "000")
+              --max-time 5 \
+              "${APP_URL}/actuator/health" 2>/dev/null || echo "000")
             if [ "${HTTP_CODE}" = "200" ]; then
-              echo "actuator/health responded HTTP 200 (attempt ${i})"
+              echo "actuator/health → HTTP 200 (attempt ${i}/24)"
               break
             fi
-            echo "  attempt ${i}/12 — HTTP ${HTTP_CODE} — retrying in 5s..."
+            echo "  attempt ${i}/24 — HTTP ${HTTP_CODE} — retrying in 5s..."
             sleep 5
           done
 
           if [ "${HTTP_CODE}" != "200" ]; then
-            echo "::error::Health check failed after 60s — HTTP ${HTTP_CODE}"
+            echo "::error::Health check FAILED after 120s — last HTTP code: ${HTTP_CODE}"
+            echo "--- Final curl verbose output ---"
+            curl -sv --max-time 5 "${APP_URL}/actuator/health" 2>&1 || true
+            echo "--- Port binding at failure time ---"
+            ss -tlnp 2>/dev/null | grep 9966 || echo "(9966 not bound)"
             exit 1
           fi
 
           HEALTH_STATUS=$(jq -r '.status // "UNKNOWN"' /tmp/health.json 2>/dev/null || echo "UNKNOWN")
-          echo "Health status: ${HEALTH_STATUS}"
+          echo "Spring Boot health status: ${HEALTH_STATUS}"
 
+          # ── Non-fatal smoke tests — record result but never block deploy ────
+          # (Swagger returns 302 redirect; /api/* may return 401 if security enabled)
           echo "── API Smoke Test (/api/specialties) ─────────────────────────"
           API_CODE=$(curl -s -o /tmp/api-response.json -w "%{http_code}" \
-            "${APP_URL}/api/specialties" || echo "000")
-          echo "API smoke test HTTP: ${API_CODE}"
+            --max-time 5 "${APP_URL}/api/specialties" 2>/dev/null || echo "000")
+          echo "  HTTP ${API_CODE}"
 
           echo "── Swagger UI Smoke Test ─────────────────────────────────────"
           SWAGGER_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
-            "${APP_URL}/swagger-ui/index.html" || echo "000")
-          echo "Swagger UI HTTP: ${SWAGGER_CODE}"
+            --max-time 5 -L "${APP_URL}/swagger-ui/index.html" 2>/dev/null || echo "000")
+          echo "  HTTP ${SWAGGER_CODE}"
 
           echo "── Prometheus Metrics Smoke Test ─────────────────────────────"
+          # Endpoint: GET /petclinic/actuator/prometheus (exposed in application.properties)
+          # In CI this is reachable at localhost:9966 via KIND extraPortMappings hostPort.
+          # host.docker.internal:9966 is ONLY for local docker-compose Prometheus scraping.
           METRICS_CODE=$(curl -s -o /tmp/metrics.txt -w "%{http_code}" \
-            "${APP_URL}/actuator/prometheus" || echo "000")
-          echo "Prometheus metrics HTTP: ${METRICS_CODE}"
+            --max-time 5 "${APP_URL}/actuator/prometheus" 2>/dev/null || echo "000")
+          echo "  HTTP ${METRICS_CODE}"
+          if [ "${METRICS_CODE}" = "200" ]; then
+            echo "  Sample metrics (first 5 lines):"
+            head -5 /tmp/metrics.txt 2>/dev/null || true
+          fi
 
-          echo "HEALTH_STATUS=${HEALTH_STATUS}"   >> "$GITHUB_ENV"
-          echo "HEALTH_HTTP=${HTTP_CODE}"         >> "$GITHUB_ENV"
-          echo "API_HTTP=${API_CODE}"             >> "$GITHUB_ENV"
-          echo "SWAGGER_HTTP=${SWAGGER_CODE}"     >> "$GITHUB_ENV"
-          echo "METRICS_HTTP=${METRICS_CODE}"     >> "$GITHUB_ENV"
+          # ── Export to GitHub ENV for summary step ───────────────────────────
+          {
+            echo "HEALTH_STATUS=${HEALTH_STATUS}"
+            echo "HEALTH_HTTP=${HTTP_CODE}"
+            echo "API_HTTP=${API_CODE}"
+            echo "SWAGGER_HTTP=${SWAGGER_CODE}"
+            echo "METRICS_HTTP=${METRICS_CODE}"
+          } >> "$GITHUB_ENV"
 
+          # ── Hard gate — only health UP is a deploy blocker ──────────────────
           if [ "${HEALTH_STATUS}" != "UP" ]; then
-            echo "::error::Application health is ${HEALTH_STATUS} — expected UP"
+            echo "::error::Application health is '${HEALTH_STATUS}' — expected 'UP'. Deploy failed."
             exit 1
           fi
 
-          echo "All validation checks passed"
+          echo "✅ All validation checks complete"
 
       # ── 12. Write comprehensive GitHub Actions Job Summary ─────────────────
       - name: Write Full Deployment Summary

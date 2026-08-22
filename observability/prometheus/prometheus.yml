@@ -23,8 +23,11 @@ scrape_configs:
   - job_name: petclinic-rest
     metrics_path: /petclinic/actuator/prometheus
     static_configs:
+      # host.docker.internal resolves only on Docker Desktop (Mac/Windows).
+      # On Linux (GitHub Actions / KIND) use host-gateway or localhost.
+      # docker-compose.yml already maps extra_hosts: host.docker.internal → host-gateway
+      # so this target works for local docker-compose runs AND CI (KIND hostPort 9966).
       - targets: [ "host.docker.internal:9966" ]
-    # Label every scraped sample with the environment name
     relabel_configs:
       - target_label: environment
         replacement: local

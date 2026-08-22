@@ -9,4 +9,5 @@ nodes:
     extraPortMappings:
       - containerPort: 30966   # maps to NodePort 30966 on the node
         hostPort: 9966         # reachable at localhost:9966 on the runner
+        listenAddress: "127.0.0.1"  # bind to runner loopback — required for curl in CI
         protocol: TCP
