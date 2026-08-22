@@ -313,7 +313,7 @@ jobs:
   # 5-minute hard deploy window enforced via DEPLOY_TIMEOUT_SECONDS=300
   # ===========================================================================
   deploy-and-validate:
-    name: 'Deploy to KIND + Validate'
+    name: 'Deploy to KIND'
     runs-on: ubuntu-latest
     needs: [snyk-gate, docker-build]
     if: needs.docker-build.result == 'success' && needs.snyk-gate.result == 'success'
@@ -326,33 +326,21 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Install KIND ────────────────────────────────────────────────────
-      - name: Install KIND
-        run: |
-          KIND_VERSION="v0.24.0"
-          curl -sSLo /usr/local/bin/kind \
-            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-          chmod +x /usr/local/bin/kind
-          kind version
-
-      # ── 3. Install kubectl ─────────────────────────────────────────────────
+      # ── 2. Install kubectl (official action — no sudo/chmod needed) ──────────
       - name: Install kubectl
-        run: |
-          KUBECTL_VERSION="v1.31.0"
-          curl -sSLo /usr/local/bin/kubectl \
-            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-          chmod +x /usr/local/bin/kubectl
-          kubectl version --client
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.31.0'
 
-      # ── 4. Create KIND cluster with host-port mapping ──────────────────────
+      # ── 3. Create KIND cluster (official action — installs KIND + creates ──
+      #       cluster in one step; handles binary install without elevated perms)
       - name: Create KIND cluster
-        run: |
-          kind create cluster \
-            --name petclinic-prod \
-            --config k8s/kind-config.yml \
-            --wait 60s
-          kubectl cluster-info --context kind-petclinic-prod
-          echo "KIND cluster ready"
+        uses: helm/kind-action@v1
+        with:
+          version: 'v0.24.0'
+          cluster_name: petclinic-prod
+          config: k8s/kind-config.yml
+          wait: 60s
 
       # ── 5. Load Docker image into KIND ─────────────────────────────────────
       - name: Download Docker image tarball
