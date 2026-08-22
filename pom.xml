@@ -19,6 +19,26 @@
 
     <properties>
 
+        <!-- ── Security-fix version overrides ────────────────────────────────
+             These pin transitive dependencies to patched versions, overriding
+             the Spring Boot BOM where necessary to resolve Snyk High findings.
+             Review and update whenever a new vulnerability advisory is issued.
+             ──────────────────────────────────────────────────────────────── -->
+        <!-- CVE: Expression Injection in logback-core < 1.5.36 -->
+        <logback.version>1.5.36</logback.version>
+        <!-- CVE: Improper Authentication + Error Detection in tomcat-embed-core < 11.0.23 -->
+        <tomcat.version>11.0.23</tomcat.version>
+        <!-- CVE: Incorrect Auth Algorithm in postgresql < 42.7.12 -->
+        <postgresql.version>42.7.12</postgresql.version>
+        <!-- CVE: Incorrect Authorization in com.fasterxml jackson-databind < 2.21.5
+             jackson-2-bom.version is the Spring Boot BOM property for Jackson 2.x (fasterxml).
+             Pinning this upgrades jackson-databind + jackson-core to 2.21.5. -->
+        <jackson-2-bom.version>2.21.5</jackson-2-bom.version>
+        <!-- NOTE: tools.jackson (Jackson 3.x) is pinned via dependencyManagement below.
+             We do NOT override jackson-bom.version here because bumping the full
+             tools.jackson BOM to 3.2.1 causes a classpath conflict with fasterxml 2.21.5
+             (JsonApplyView NoClassDefFoundError). Individual artifact pins are safer. -->
+
         <!-- Third-party libraries -->
         <spring-data-jdbc.version>1.2.1.RELEASE</spring-data-jdbc.version>
         <springdoc-openapi-ui.version>3.0.3</springdoc-openapi-ui.version>
@@ -42,6 +62,33 @@
         <maven.version>3.9.9</maven.version>
 
     </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <!-- CVE: Allocation of Resources Without Limits (spring-retry < 2.0.13)
+                 spring-retry 1.0.3.RELEASE is pulled transitively by spring-data-jdbc-core
+                 and is NOT covered by the Spring Boot BOM. Pin it here explicitly. -->
+            <dependency>
+                <groupId>org.springframework.retry</groupId>
+                <artifactId>spring-retry</artifactId>
+                <version>2.0.13</version>
+            </dependency>
+            <!-- CVE: Incorrect Authorization in tools.jackson:jackson-databind < 3.1.5
+                 Pin individual artifacts to 3.1.5 directly — safer than bumping the
+                 full jackson-bom.version which causes classpath conflicts with
+                 com.fasterxml.jackson 2.21.5 (JsonApplyView NoClassDefFoundError). -->
+            <dependency>
+                <groupId>tools.jackson.core</groupId>
+                <artifactId>jackson-core</artifactId>
+                <version>3.1.5</version>
+            </dependency>
+            <dependency>
+                <groupId>tools.jackson.core</groupId>
+                <artifactId>jackson-databind</artifactId>
+                <version>3.1.5</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 
     <dependencies>
         <!-- Spring Boot Dependencies all inherit from the spring-boot-starter-parent -->
