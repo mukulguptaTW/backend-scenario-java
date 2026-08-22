@@ -1,0 +1,568 @@
+name: PR Pipeline
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers
+#  • pull_request → runs the full quality + security gate on every PR to main
+#  • When this PR is merged to main it automatically triggers build.yml
+#    (build.yml listens on push:branches:main — no extra glue needed)
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+
+# ── Workflow-level permissions (least-privilege) ──────────────────────────────
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write          # post inline PR review comments
+  security-events: write        # upload SARIF to GitHub Code Scanning
+
+# ── Workflow-level non-sensitive config ───────────────────────────────────────
+env:
+  SONAR_HOST_URL: https://sonarcloud.io
+  SONAR_ORGANIZATION: mukulguptatw
+  JAVA_VERSION: '21'
+  NODE_VERSION: '22'
+  SNYK_CLI_VERSION: '1.1295.1'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONCURRENCY — cancel stale PR runs when a new commit is pushed
+# ─────────────────────────────────────────────────────────────────────────────
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 1 ── Build & Test (Java 21, JaCoCo coverage enforcement)
+  # ═══════════════════════════════════════════════════════════════════════════
+  build:
+    name: 🏗️ Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Java 21 ───────────────────────────────────────────────────────
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # ── 3. Cache Maven wrapper (avoid 429 rate-limits) ───────────────────
+      - name: Cache Maven wrapper distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/wrapper
+          key: mvnw-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+          restore-keys: mvnw-${{ runner.os }}-
+
+      # ── 4. Build, test, enforce JaCoCo coverage thresholds ───────────────
+      - name: Build and verify
+        run: ./mvnw -B verify --no-transfer-progress
+
+      # ── 5. Publish JUnit test results in the Actions UI ──────────────────
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: JUnit Test Results (PR)
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      # ── 6. Upload JaCoCo XML for SonarQube ───────────────────────────────
+      - name: Upload JaCoCo XML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: target/site/jacoco/jacoco.xml
+          retention-days: 1
+
+      # ── 7. Persist compiled artifacts for parallel security jobs ─────────
+      - name: Cache Maven local repository for downstream jobs
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+
+      - name: Upload build target for security scans
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-target
+          path: |
+            target/classes
+            target/generated-sources
+            target/site/jacoco/jacoco.xml
+            pom.xml
+          retention-days: 1
+
+      # ── 8. Write Build Summary ────────────────────────────────────────────
+      - name: Write Build Summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          ICON="✅"
+          [ "$STATUS" != "success" ] && ICON="❌"
+          {
+            echo "## ${ICON} Build & Test — ${STATUS^^}"
+            echo ""
+            echo "| Detail       | Value |"
+            echo "|:-------------|:------|"
+            echo "| **PR**       | #${{ github.event.pull_request.number }} |"
+            echo "| **Branch**   | \`${{ github.head_ref }}\` → \`${{ github.base_ref }}\` |"
+            echo "| **Commit**   | \`${{ github.sha }}\` |"
+            echo "| **Java**     | ${{ env.JAVA_VERSION }} (Temurin) |"
+            echo "| **Coverage** | Enforced: LINE ≥ 85 %, BRANCH ≥ 66 % |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 2 ── SonarQube Analysis  (runs in PARALLEL with snyk after build)
+  # Required secrets:
+  #   SONAR_TOKEN — project token from https://sonarcloud.io/account/security
+  # ═══════════════════════════════════════════════════════════════════════════
+  sonarqube:
+    name: 🔍 SonarQube Analysis
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      # ── 1. Checkout (full history required for blame / new-code detection) ─
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── 2. Java 21 ───────────────────────────────────────────────────────
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # ── 3. Restore caches ────────────────────────────────────────────────
+      - name: Restore Maven local repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+
+      - name: Cache Maven wrapper distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/wrapper
+          key: mvnw-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+          restore-keys: mvnw-${{ runner.os }}-
+
+      # ── 4. Download compiled classes + JaCoCo coverage ───────────────────
+      - name: Download build target artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-target
+          path: .
+
+      # ── 5. Run SonarQube scanner ─────────────────────────────────────────
+      #       Reads compiled .class files and JaCoCo XML; does NOT recompile.
+      #       SONAR_TOKEN is read from GitHub Secrets — never logged or echoed.
+      - name: Run SonarQube analysis
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          # Required by sonar-maven-plugin to decorate PR checks
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ./mvnw -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.1.0.4751:sonar \
+            --no-transfer-progress \
+            -Dsonar.projectKey=spring-petclinic-rest1 \
+            -Dsonar.projectName="Spring PetClinic REST" \
+            -Dsonar.organization="${{ env.SONAR_ORGANIZATION }}" \
+            -Dsonar.host.url="${{ env.SONAR_HOST_URL }}" \
+            -Dsonar.token="${SONAR_TOKEN}" \
+            -Dsonar.java.binaries=target/classes \
+            -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml \
+            -Dsonar.sources=src/main/java \
+            -Dsonar.tests=src/test/java \
+            -Dsonar.exclusions="**/rest/dto/**,**/rest/api/**" \
+            -Dsonar.scm.provider=git \
+            -Dsonar.pullrequest.key=${{ github.event.pull_request.number }} \
+            -Dsonar.pullrequest.branch=${{ github.head_ref }} \
+            -Dsonar.pullrequest.base=${{ github.base_ref }}
+
+      # ── 6. Write SonarQube Summary ────────────────────────────────────────
+      - name: Write SonarQube Summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          ICON="✅"
+          [ "$STATUS" != "success" ] && ICON="❌"
+          SONAR_URL="${{ env.SONAR_HOST_URL }}/dashboard?id=spring-petclinic-rest1&pullRequest=${{ github.event.pull_request.number }}"
+          {
+            echo "## ${ICON} SonarQube Analysis — ${STATUS^^}"
+            echo ""
+            echo "| Detail          | Value |"
+            echo "|:----------------|:------|"
+            echo "| **PR**          | #${{ github.event.pull_request.number }} |"
+            echo "| **Branch**      | \`${{ github.head_ref }}\` |"
+            echo "| **Organization**| \`${{ env.SONAR_ORGANIZATION }}\` |"
+            echo "| **Dashboard**   | [Open in SonarCloud](${SONAR_URL}) |"
+            echo ""
+            echo "> Quality Gate result is available on the SonarCloud dashboard linked above."
+            echo "> SonarCloud will also post a status check on this PR automatically."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 3 ── Snyk Security Scan  (runs in PARALLEL with sonarqube after build)
+  # Required secrets:
+  #   SNYK_TOKEN — API token from https://app.snyk.io/account (User Settings)
+  # ═══════════════════════════════════════════════════════════════════════════
+  snyk:
+    name: 🔐 Snyk Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      # SNYK_TOKEN is picked up natively by the Snyk CLI — no `snyk auth` needed.
+      # Never logged, never passed as a CLI argument.
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Java 21 ───────────────────────────────────────────────────────
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      # ── 3. Node.js for Snyk CLI ──────────────────────────────────────────
+      - name: Set up Node.js (for Snyk CLI)
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # ── 4. Install Snyk CLI at pinned version (supply-chain safety) ──────
+      - name: Install Snyk CLI
+        run: npm install --global snyk@${{ env.SNYK_CLI_VERSION }}
+
+      # ── 5. Restore Maven cache ────────────────────────────────────────────
+      - name: Restore Maven local repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+
+      # ── 6. Snyk Open-Source dependency vulnerability scan ────────────────
+      #       --severity-threshold=high → fail on High/Critical only
+      #       continue-on-error → allows SARIF upload even when vulns found
+      - name: Snyk dependency vulnerability test
+        run: |
+          snyk test \
+            --all-projects \
+            --severity-threshold=high \
+            --json-file-output=snyk-results.json
+        continue-on-error: true
+
+      # ── 7. Convert results to SARIF ───────────────────────────────────────
+      - name: Convert Snyk results to SARIF
+        if: always()
+        run: |
+          snyk test \
+            --all-projects \
+            --severity-threshold=high \
+            --sarif-file-output=snyk.sarif || true
+
+      # ── 8. Upload SARIF to GitHub Code Scanning ──────────────────────────
+      - name: Upload Snyk SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-oss-pr
+
+      # ── 9. Upload raw JSON report ─────────────────────────────────────────
+      - name: Upload Snyk JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-results-pr
+          path: snyk-results.json
+          retention-days: 14
+
+      # ── 10. Publish Snyk Summary to GitHub Job Summary ────────────────────
+      - name: Publish Snyk Security Summary
+        if: always()
+        run: |
+          RESULTS_FILE="snyk-results.json"
+          SUMMARY_FILE="${GITHUB_STEP_SUMMARY}"
+
+          summary() { printf '%s\n' "$*" >> "${SUMMARY_FILE}"; }
+
+          summary "## 🔐 Snyk Security Scan — PR #${{ github.event.pull_request.number }}"
+          summary ""
+          summary "| Detail        | Value |"
+          summary "|:--------------|:------|"
+          summary "| **PR**        | #${{ github.event.pull_request.number }} |"
+          summary "| **Branch**    | \`${{ github.head_ref }}\` |"
+          summary "| **Commit**    | \`${{ github.sha }}\` |"
+          summary "| **Snyk CLI**  | $(snyk --version 2>/dev/null || echo 'unknown') |"
+          summary ""
+
+          if [ ! -f "${RESULTS_FILE}" ]; then
+            summary "> ⚠️ \`snyk-results.json\` was not found. The scan may have failed."
+            exit 0
+          fi
+
+          if ! jq empty "${RESULTS_FILE}" 2>/dev/null; then
+            summary "> ⚠️ \`snyk-results.json\` contains invalid JSON. Cannot parse results."
+            exit 0
+          fi
+
+          NORMALISED=$(jq 'if type == "array" then . else [.] end' "${RESULTS_FILE}")
+
+          COUNT_CRITICAL=$(echo "${NORMALISED}" | jq '[.[].vulnerabilities[]? | select(.severity=="critical")] | length')
+          COUNT_HIGH=$(echo     "${NORMALISED}" | jq '[.[].vulnerabilities[]? | select(.severity=="high")]     | length')
+          COUNT_MEDIUM=$(echo   "${NORMALISED}" | jq '[.[].vulnerabilities[]? | select(.severity=="medium")]   | length')
+          COUNT_LOW=$(echo      "${NORMALISED}" | jq '[.[].vulnerabilities[]? | select(.severity=="low")]      | length')
+          COUNT_TOTAL=$(echo    "${NORMALISED}" | jq '[.[].vulnerabilities[]?] | length')
+
+          if [ "${COUNT_CRITICAL}" -gt 0 ] || [ "${COUNT_HIGH}" -gt 0 ]; then
+            summary "### ❌ Gate: FAILED — Critical or High vulnerabilities detected"
+          else
+            summary "### ✅ Gate: PASSED — No Critical or High vulnerabilities"
+          fi
+          summary ""
+
+          summary "### 📊 Vulnerability Summary"
+          summary ""
+          summary "| Severity     | Count |"
+          summary "|:-------------|------:|"
+          summary "| 🔴 Critical  | ${COUNT_CRITICAL} |"
+          summary "| 🟠 High      | ${COUNT_HIGH} |"
+          summary "| 🟡 Medium    | ${COUNT_MEDIUM} |"
+          summary "| 🔵 Low       | ${COUNT_LOW} |"
+          summary "| **Total**    | **${COUNT_TOTAL}** |"
+          summary ""
+
+          summary "### 🔎 Top Findings (up to 10, sorted by severity)"
+          summary ""
+          summary "| # | Severity | Package | Installed | Fixed In | Title |"
+          summary "|---|:---------|:--------|:----------|:---------|:------|"
+
+          echo "${NORMALISED}" | jq -r '
+            [ .[].vulnerabilities[]?
+              | {
+                  sev:   .severity,
+                  pkg:   (.packageName // "n/a"),
+                  ver:   (.version    // "n/a"),
+                  fix:   (if (.fixedIn | length) > 0 then (.fixedIn | join(", ")) else "No fix" end),
+                  title: (.title      // "n/a")
+                }
+            ]
+            | sort_by(
+                if   .sev=="critical" then 0
+                elif .sev=="high"     then 1
+                elif .sev=="medium"   then 2
+                else 3 end
+              )
+            | .[:10][]
+            | [.sev, .pkg, .ver, .fix, .title]
+            | @tsv
+          ' | awk -F'\t' 'BEGIN{i=1} {
+              sev=$1; pkg=$2; ver=$3; fix=$4; title=$5
+              emoji="🔵"
+              if (sev=="critical") emoji="🔴"
+              else if (sev=="high") emoji="🟠"
+              else if (sev=="medium") emoji="🟡"
+              printf "| %d | %s %s | `%s` | `%s` | %s | %s |\n", i++, emoji, sev, pkg, ver, fix, title
+          }' >> "${SUMMARY_FILE}"
+
+          summary ""
+          summary "---"
+          summary "> 📦 **Full report:** Download the \`snyk-results-pr\` artifact from the Artifacts section."
+          summary "> 🔍 **Code Scanning:** See **Security → Code scanning alerts** for SARIF findings."
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 4 ── Automatic PR Review  (posts gate results as PR comments)
+  # ═══════════════════════════════════════════════════════════════════════════
+  pr-review:
+    name: 📝 Automatic PR Review
+    runs-on: ubuntu-latest
+    # Wait for ALL gate jobs — review summarises their outcomes
+    needs: [build, sonarqube, snyk]
+    if: always()
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Download Snyk JSON to extract counts for PR comment ────────────
+      - name: Download Snyk results
+        uses: actions/download-artifact@v4
+        with:
+          name: snyk-results-pr
+          path: .
+        continue-on-error: true   # if snyk job was skipped, don't fail this step
+
+      # ── 3. Compute gate statuses and post PR review comment ───────────────
+      - name: Post PR Review Comment
+        uses: actions/github-script@v7
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          SONAR_RESULT: ${{ needs.sonarqube.result }}
+          SNYK_RESULT:  ${{ needs.snyk.result }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+          SONAR_ORGANIZATION: ${{ env.SONAR_ORGANIZATION }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+
+            const buildResult  = process.env.BUILD_RESULT;
+            const sonarResult  = process.env.SONAR_RESULT;
+            const snykResult   = process.env.SNYK_RESULT;
+            const sonarHostUrl = process.env.SONAR_HOST_URL;
+            const prNumber     = context.payload.pull_request.number;
+            const headSha      = context.payload.pull_request.head.sha.substring(0, 7);
+            const headRef      = context.payload.pull_request.head.ref;
+            const baseRef      = context.payload.pull_request.base.ref;
+
+            const icon = r => r === 'success' ? '✅' : r === 'skipped' ? '⏭️' : '❌';
+
+            // ── Parse Snyk vulnerability counts ─────────────────────────────
+            let critical = 0, high = 0, medium = 0, low = 0, total = 0;
+            let snykGateIcon = '⚠️';
+            try {
+              const raw = fs.readFileSync('snyk-results.json', 'utf8');
+              const data = JSON.parse(raw);
+              const arr  = Array.isArray(data) ? data : [data];
+              const vulns = arr.flatMap(p => p.vulnerabilities || []);
+              critical = vulns.filter(v => v.severity === 'critical').length;
+              high     = vulns.filter(v => v.severity === 'high').length;
+              medium   = vulns.filter(v => v.severity === 'medium').length;
+              low      = vulns.filter(v => v.severity === 'low').length;
+              total    = vulns.length;
+              snykGateIcon = (critical > 0 || high > 0) ? '❌' : '✅';
+            } catch (_) {
+              snykGateIcon = snykResult === 'success' ? '✅' : '❌';
+            }
+
+            // ── Overall gate decision ─────────────────────────────────────────
+            const allPassed = buildResult === 'success'
+                           && sonarResult === 'success'
+                           && (critical === 0 && high === 0);
+            const overallIcon  = allPassed ? '✅' : '❌';
+            const overallLabel = allPassed ? 'ALL GATES PASSED — Ready to merge' : 'GATE(S) FAILED — Do not merge';
+
+            const sonarDashUrl =
+              `${sonarHostUrl}/dashboard?id=spring-petclinic-rest1&pullRequest=${prNumber}`;
+
+            const body = `## ${overallIcon} PR Quality & Security Gate — ${overallLabel}
+
+            > **PR #${prNumber}** · \`${headRef}\` → \`${baseRef}\` · commit \`${headSha}\`
+
+            ---
+
+            ### 🚦 Gate Summary
+
+            | Gate                  | Status              | Detail |
+            |:----------------------|:--------------------|:-------|
+            | 🏗️ Build & Tests      | ${icon(buildResult)} ${buildResult.toUpperCase()} | Java 21 · JaCoCo LINE ≥ 85 % / BRANCH ≥ 66 % |
+            | 🔍 SonarQube          | ${icon(sonarResult)} ${sonarResult.toUpperCase()} | [View dashboard](${sonarDashUrl}) |
+            | 🔐 Snyk (High/Crit)   | ${snykGateIcon} ${snykResult.toUpperCase()} | See below |
+
+            ---
+
+            ### 🔐 Snyk Vulnerability Counts
+
+            | Severity     | Count |
+            |:-------------|------:|
+            | 🔴 Critical  | **${critical}** |
+            | 🟠 High      | **${high}** |
+            | 🟡 Medium    | ${medium} |
+            | 🔵 Low       | ${low} |
+            | **Total**    | **${total}** |
+
+            ${(critical > 0 || high > 0)
+              ? '> ❌ **Merge is blocked** — resolve all Critical and High vulnerabilities before merging.'
+              : '> ✅ No Critical or High vulnerabilities — Snyk gate passed.'}
+
+            ---
+
+            ### 📋 Merge Checklist
+
+            - [${buildResult === 'success' ? 'x' : ' '}] Build passes and all tests green
+            - [${buildResult === 'success' ? 'x' : ' '}] JaCoCo coverage thresholds met (LINE ≥ 85 %, BRANCH ≥ 66 %)
+            - [${sonarResult === 'success' ? 'x' : ' '}] SonarQube Quality Gate passed
+            - [${snykGateIcon === '✅' ? 'x' : ' '}] No Critical or High Snyk vulnerabilities
+            - [ ] Code reviewed by at least one peer reviewer
+            - [ ] Relevant documentation / changelog updated
+
+            ---
+
+            > 💡 Merging this PR to \`main\` will **automatically trigger the production deploy pipeline** (\`build.yml\`).
+            > Production deploy targets the **KIND cluster** and enforces: no broken build · no High/Critical vulnerabilities · 5-minute deploy window.`;
+
+            // ── Delete any previous bot comment on this PR ───────────────────
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: prNumber,
+            });
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('PR Quality & Security Gate')
+            );
+            if (botComment) {
+              await github.rest.issues.deleteComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                comment_id: botComment.id,
+              });
+            }
+
+            // ── Post fresh comment ──────────────────────────────────────────
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
+
+            // ── Fail the workflow if any gate failed ────────────────────────
+            if (!allPassed) {
+              core.setFailed(`Gate(s) failed — Build: ${buildResult}, Sonar: ${sonarResult}, Snyk critical: ${critical}, high: ${high}`);
+            }
+
+      # ── 4. Write PR Review Summary to GitHub Actions Summary ─────────────
+      - name: Write PR Review Summary
+        if: always()
+        run: |
+          BUILD="${{ needs.build.result }}"
+          SONAR="${{ needs.sonarqube.result }}"
+          SNYK="${{ needs.snyk.result }}"
+          icon() { [ "$1" = "success" ] && echo "✅" || echo "❌"; }
+          {
+            echo "## 📝 Automatic PR Review Summary"
+            echo ""
+            echo "| Gate          | Result |"
+            echo "|:--------------|:-------|"
+            echo "| Build & Tests | $(icon $BUILD) ${BUILD^^} |"
+            echo "| SonarQube     | $(icon $SONAR) ${SONAR^^} |"
+            echo "| Snyk Security | $(icon $SNYK) ${SNYK^^} |"
+            echo ""
+            echo "> Full gate detail posted as a PR comment."
+          } >> "$GITHUB_STEP_SUMMARY"

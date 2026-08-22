@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: petclinic-rest
+  namespace: petclinic-prod
+  labels:
+    app.kubernetes.io/name: petclinic-rest
+    app.kubernetes.io/version: "4.0.2"
+    env: production
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: petclinic-rest
+  template:
+    metadata:
+      labels:
+        app: petclinic-rest
+        app.kubernetes.io/name: petclinic-rest
+        env: production
+    spec:
+      # ── Security context: run as non-root ──────────────────────────────────
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+      containers:
+        - name: petclinic-rest
+          # IMAGE_PLACEHOLDER is replaced by the CD pipeline at deploy time
+          image: petclinic-rest:IMAGE_TAG
+          # KIND clusters load images via `kind load image-archive` into the
+          # node's local containerd store — there is no registry involved.
+          # Never = use the locally loaded image only; prevents ErrImagePull.
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 9966
+              name: http
+          # ── Security: drop all capabilities, read-only root fs ─────────────
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false   # Spring Boot writes temp files
+            capabilities:
+              drop:
+                - ALL
+          # ── Resource guardrails ────────────────────────────────────────────
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "512Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          # ── Health probes ──────────────────────────────────────────────────
+          livenessProbe:
+            httpGet:
+              path: /petclinic/actuator/health
+              port: 9966
+            initialDelaySeconds: 40
+            periodSeconds: 15
+            failureThreshold: 4
+          readinessProbe:
+            httpGet:
+              path: /petclinic/actuator/health
+              port: 9966
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+          # ── Spring Boot active profiles (H2 in-memory for prod-demo) ───────
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "h2,spring-data-jpa"
+            - name: SERVER_PORT
+              value: "9966"

@@ -1,0 +1,585 @@
+name: Production Deploy
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trigger — fires automatically whenever a PR is merged into main.
+# The PR pipeline (pr.yml) runs on pull_request events; this pipeline runs
+# on the resulting push to main, forming a two-stage gate:
+#
+#   PR open  →  pr.yml  (quality + security gate, review comment)
+#   PR merge →  deploy.yml  (re-gate + build image + KIND deploy + validate)
+#
+# Required GitHub Secrets (Settings → Secrets → Actions):
+#   SNYK_TOKEN  — https://app.snyk.io/account
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+
+# ── Least-privilege permissions ───────────────────────────────────────────────
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+  security-events: write
+
+# ── Workflow-level non-sensitive configuration ────────────────────────────────
+env:
+  JAVA_VERSION: '21'
+  NODE_VERSION: '22'
+  SNYK_CLI_VERSION: '1.1295.1'
+  IMAGE_NAME: petclinic-rest
+  K8S_NAMESPACE: petclinic-prod
+  DEPLOY_TIMEOUT_SECONDS: 300
+
+# ── One deploy at a time — never cancel an in-flight production deploy ────────
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  # ===========================================================================
+  # JOB 1 — Build & Test  (broken build never reaches production)
+  # ===========================================================================
+  build:
+    name: 'Build & Test'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Cache Maven wrapper distribution
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/wrapper
+          key: mvnw-${{ runner.os }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+          restore-keys: mvnw-${{ runner.os }}-
+
+      - name: Build and verify (tests + JaCoCo coverage gate)
+        run: ./mvnw -B verify --no-transfer-progress
+
+      - name: Publish test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: JUnit Test Results (Deploy Gate)
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          fail-on-error: false
+
+      - name: Upload application JAR
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: petclinic-jar
+          path: target/*.jar
+          retention-days: 7
+
+      - name: Cache Maven local repository for downstream jobs
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+
+      - name: Write Build Summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          ICON="✅"; [ "$STATUS" != "success" ] && ICON="❌"
+          {
+            echo "## ${ICON} Build & Test — ${STATUS^^}"
+            echo ""
+            echo "| Detail       | Value |"
+            echo "|:-------------|:------|"
+            echo "| **Commit**   | \`${{ github.sha }}\` |"
+            echo "| **Branch**   | \`${{ github.ref_name }}\` |"
+            echo "| **Java**     | ${{ env.JAVA_VERSION }} (Temurin) |"
+            echo "| **Coverage** | LINE >= 85% · BRANCH >= 66% (enforced) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # JOB 2 — Snyk Re-Gate  (HARD BLOCK — no High/Critical vulns reach prod)
+  # Re-runs on the exact merged commit, not just the PR branch tip.
+  # ===========================================================================
+  snyk-gate:
+    name: 'Snyk Security Gate (Pre-Deploy)'
+    runs-on: ubuntu-latest
+    needs: build
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+    outputs:
+      critical: ${{ steps.parse.outputs.critical }}
+      high:     ${{ steps.parse.outputs.high }}
+      medium:   ${{ steps.parse.outputs.medium }}
+      low:      ${{ steps.parse.outputs.low }}
+      total:    ${{ steps.parse.outputs.total }}
+      gate:     ${{ steps.parse.outputs.gate }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Snyk CLI (pinned version)
+        run: npm install --global snyk@${{ env.SNYK_CLI_VERSION }}
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Restore Maven local repository cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: maven-${{ runner.os }}-
+
+      - name: Snyk dependency vulnerability test
+        run: |
+          snyk test \
+            --all-projects \
+            --severity-threshold=high \
+            --json-file-output=snyk-results.json
+        continue-on-error: true
+
+      - name: Convert Snyk results to SARIF
+        if: always()
+        run: |
+          snyk test \
+            --all-projects \
+            --severity-threshold=high \
+            --sarif-file-output=snyk.sarif || true
+
+      - name: Upload Snyk SARIF to GitHub Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk-oss-deploy
+
+      - name: Parse Snyk results and set job outputs
+        id: parse
+        if: always()
+        run: |
+          RESULTS_FILE="snyk-results.json"
+          if [ ! -f "${RESULTS_FILE}" ] || ! jq empty "${RESULTS_FILE}" 2>/dev/null; then
+            echo "critical=0" >> "$GITHUB_OUTPUT"
+            echo "high=0"     >> "$GITHUB_OUTPUT"
+            echo "medium=0"   >> "$GITHUB_OUTPUT"
+            echo "low=0"      >> "$GITHUB_OUTPUT"
+            echo "total=0"    >> "$GITHUB_OUTPUT"
+            echo "gate=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          N=$(jq 'if type == "array" then . else [.] end' "${RESULTS_FILE}")
+          CRITICAL=$(echo "$N" | jq '[.[].vulnerabilities[]? | select(.severity=="critical")] | length')
+          HIGH=$(echo     "$N" | jq '[.[].vulnerabilities[]? | select(.severity=="high")]     | length')
+          MEDIUM=$(echo   "$N" | jq '[.[].vulnerabilities[]? | select(.severity=="medium")]   | length')
+          LOW=$(echo      "$N" | jq '[.[].vulnerabilities[]? | select(.severity=="low")]      | length')
+          TOTAL=$(echo    "$N" | jq '[.[].vulnerabilities[]?] | length')
+          echo "critical=${CRITICAL}" >> "$GITHUB_OUTPUT"
+          echo "high=${HIGH}"         >> "$GITHUB_OUTPUT"
+          echo "medium=${MEDIUM}"     >> "$GITHUB_OUTPUT"
+          echo "low=${LOW}"           >> "$GITHUB_OUTPUT"
+          echo "total=${TOTAL}"       >> "$GITHUB_OUTPUT"
+          if [ "${CRITICAL}" -gt 0 ] || [ "${HIGH}" -gt 0 ]; then
+            echo "gate=FAILED" >> "$GITHUB_OUTPUT"
+          else
+            echo "gate=PASSED" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload Snyk JSON report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snyk-results-deploy
+          path: snyk-results.json
+          retention-days: 14
+
+      - name: Enforce security gate — block deploy on High/Critical
+        if: always()
+        run: |
+          CRITICAL=${{ steps.parse.outputs.critical }}
+          HIGH=${{ steps.parse.outputs.high }}
+          if [ "${CRITICAL}" -gt 0 ] || [ "${HIGH}" -gt 0 ]; then
+            echo "::error::DEPLOY BLOCKED — ${CRITICAL} Critical and ${HIGH} High vulnerabilities found."
+            echo "::error::Resolve all Critical and High Snyk findings before deploying to production."
+            exit 1
+          fi
+          echo "Security gate passed — Critical: ${CRITICAL}, High: ${HIGH}"
+
+      - name: Write Snyk Security Summary
+        if: always()
+        run: |
+          GATE="${{ steps.parse.outputs.gate }}"
+          ICON="✅"; [ "$GATE" = "FAILED" ] && ICON="❌"
+          {
+            echo "## ${ICON} Snyk Security Gate — ${GATE}"
+            echo ""
+            echo "| Severity     | Count |"
+            echo "|:-------------|------:|"
+            echo "| 🔴 Critical  | ${{ steps.parse.outputs.critical }} |"
+            echo "| 🟠 High      | ${{ steps.parse.outputs.high }} |"
+            echo "| 🟡 Medium    | ${{ steps.parse.outputs.medium }} |"
+            echo "| 🔵 Low       | ${{ steps.parse.outputs.low }} |"
+            echo "| **Total**    | **${{ steps.parse.outputs.total }}** |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # JOB 3 — Build Docker Image
+  # ===========================================================================
+  docker-build:
+    name: 'Build Docker Image'
+    runs-on: ubuntu-latest
+    needs: [build, snyk-gate]
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.image-tag }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute image tag (short SHA for traceability)
+        id: meta
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "image-tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE_TAG=${SHORT_SHA}" >> "$GITHUB_ENV"
+
+      - name: Download application JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: petclinic-jar
+          path: target/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image and export as tar
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          # Dockerfile.ci wraps the pre-built JAR (already in target/) into a
+          # hardened JRE 21 runtime image — no Maven recompile inside Docker.
+          # Use the root Dockerfile only for local builds from source.
+          file: Dockerfile.ci
+          push: false
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          outputs: type=docker,dest=/tmp/petclinic-image.tar
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Upload Docker image tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: petclinic-docker-image
+          path: /tmp/petclinic-image.tar
+          retention-days: 1
+
+      - name: Write Docker Build Summary
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          ICON="✅"; [ "$STATUS" != "success" ] && ICON="❌"
+          {
+            echo "## ${ICON} Docker Image Build — ${STATUS^^}"
+            echo ""
+            echo "| Detail     | Value |"
+            echo "|:-----------|:------|"
+            echo "| **Image**  | \`${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\` |"
+            echo "| **Commit** | \`${{ github.sha }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # JOB 4 — Deploy to KIND Cluster + Full Validation
+  # 5-minute hard deploy window enforced via DEPLOY_TIMEOUT_SECONDS=300
+  # ===========================================================================
+  deploy-and-validate:
+    name: 'Deploy to KIND + Validate'
+    runs-on: ubuntu-latest
+    needs: [snyk-gate, docker-build]
+    if: needs.docker-build.result == 'success' && needs.snyk-gate.result == 'success'
+
+    env:
+      IMAGE_TAG: ${{ needs.docker-build.outputs.image-tag }}
+
+    steps:
+      # ── 1. Checkout — need k8s manifests ──────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Install KIND ────────────────────────────────────────────────────
+      - name: Install KIND
+        run: |
+          KIND_VERSION="v0.24.0"
+          curl -sSLo /usr/local/bin/kind \
+            "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+          chmod +x /usr/local/bin/kind
+          kind version
+
+      # ── 3. Install kubectl ─────────────────────────────────────────────────
+      - name: Install kubectl
+        run: |
+          KUBECTL_VERSION="v1.31.0"
+          curl -sSLo /usr/local/bin/kubectl \
+            "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+          kubectl version --client
+
+      # ── 4. Create KIND cluster with host-port mapping ──────────────────────
+      - name: Create KIND cluster
+        run: |
+          kind create cluster \
+            --name petclinic-prod \
+            --config k8s/kind-config.yml \
+            --wait 60s
+          kubectl cluster-info --context kind-petclinic-prod
+          echo "KIND cluster ready"
+
+      # ── 5. Load Docker image into KIND ─────────────────────────────────────
+      - name: Download Docker image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: petclinic-docker-image
+          path: /tmp/
+
+      - name: Load image into KIND cluster
+        run: |
+          kind load image-archive /tmp/petclinic-image.tar \
+            --name petclinic-prod
+          echo "Image ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} loaded into KIND"
+
+      # ── 6. Patch image tag and apply manifests ─────────────────────────────
+      - name: Apply Kubernetes manifests
+        run: |
+          sed -i "s|petclinic-rest:IMAGE_TAG|${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
+            k8s/deployment.yml
+
+          kubectl apply -f k8s/namespace.yml
+          kubectl apply -f k8s/deployment.yml
+          kubectl apply -f k8s/service.yml
+
+          echo ""
+          echo "── Applied resources ──────────────────────────────────────────"
+          kubectl get all -n ${{ env.K8S_NAMESPACE }}
+
+      # ── 7. Rollout — 5-minute hard deadline ───────────────────────────────
+      - name: Wait for rollout (max 300s / 5 minutes)
+        run: |
+          echo "Waiting for deployment rollout (timeout: ${{ env.DEPLOY_TIMEOUT_SECONDS }}s)..."
+          START=$(date +%s)
+
+          kubectl rollout status deployment/petclinic-rest \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout="${{ env.DEPLOY_TIMEOUT_SECONDS }}s"
+
+          END=$(date +%s)
+          ELAPSED=$((END - START))
+          echo "Rollout completed in ${ELAPSED}s"
+          echo "ROLLOUT_ELAPSED=${ELAPSED}" >> "$GITHUB_ENV"
+
+      # ── 8. Capture pod status ──────────────────────────────────────────────
+      - name: Capture pod status
+        if: always()
+        run: |
+          echo "── Pod Status ────────────────────────────────────────────────"
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -o wide \
+            | tee /tmp/pod-status.txt
+
+          POD_NAME=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=petclinic-rest \
+            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+          echo "POD_NAME=${POD_NAME}" >> "$GITHUB_ENV"
+
+      # ── 9. Capture pod logs ────────────────────────────────────────────────
+      # NOTE: Use shell $POD_NAME (from $GITHUB_ENV), NOT ${{ env.POD_NAME }}.
+      # The ${{ }} expression is evaluated at parse time and is empty when set
+      # by a previous step's $GITHUB_ENV write in the same job.
+      - name: Capture pod logs (last 80 lines)
+        if: always()
+        run: |
+          POD_NAME="${POD_NAME:-}"
+          if [ -n "${POD_NAME}" ]; then
+            echo "── Logs for pod: ${POD_NAME} ──────────────────────────────"
+            kubectl logs "${POD_NAME}" \
+              -n ${{ env.K8S_NAMESPACE }} \
+              --tail=80 \
+              | tee /tmp/pod-logs.txt || true
+          else
+            echo "No pod found — cannot retrieve logs" | tee /tmp/pod-logs.txt
+          fi
+
+      # ── 10. Capture pod describe for full diagnostics ──────────────────────
+      - name: Capture pod describe
+        if: always()
+        run: |
+          POD_NAME="${POD_NAME:-}"
+          if [ -n "${POD_NAME}" ]; then
+            kubectl describe pod "${POD_NAME}" \
+              -n ${{ env.K8S_NAMESPACE }} \
+              | tee /tmp/pod-describe.txt || true
+          fi
+
+      # ── 11. Full Validation — health, API smoke, Swagger UI ───────────────
+      - name: Validate deployment — health + smoke tests
+        id: validate
+        run: |
+          APP_URL="http://localhost:9966/petclinic"
+
+          echo "── Health Check ──────────────────────────────────────────────"
+          for i in $(seq 1 12); do
+            HTTP_CODE=$(curl -s -o /tmp/health.json -w "%{http_code}" \
+              "${APP_URL}/actuator/health" || echo "000")
+            if [ "${HTTP_CODE}" = "200" ]; then
+              echo "actuator/health responded HTTP 200 (attempt ${i})"
+              break
+            fi
+            echo "  attempt ${i}/12 — HTTP ${HTTP_CODE} — retrying in 5s..."
+            sleep 5
+          done
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "::error::Health check failed after 60s — HTTP ${HTTP_CODE}"
+            exit 1
+          fi
+
+          HEALTH_STATUS=$(jq -r '.status // "UNKNOWN"' /tmp/health.json 2>/dev/null || echo "UNKNOWN")
+          echo "Health status: ${HEALTH_STATUS}"
+
+          echo "── API Smoke Test (/api/specialties) ─────────────────────────"
+          API_CODE=$(curl -s -o /tmp/api-response.json -w "%{http_code}" \
+            "${APP_URL}/api/specialties" || echo "000")
+          echo "API smoke test HTTP: ${API_CODE}"
+
+          echo "── Swagger UI Smoke Test ─────────────────────────────────────"
+          SWAGGER_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${APP_URL}/swagger-ui/index.html" || echo "000")
+          echo "Swagger UI HTTP: ${SWAGGER_CODE}"
+
+          echo "── Prometheus Metrics Smoke Test ─────────────────────────────"
+          METRICS_CODE=$(curl -s -o /tmp/metrics.txt -w "%{http_code}" \
+            "${APP_URL}/actuator/prometheus" || echo "000")
+          echo "Prometheus metrics HTTP: ${METRICS_CODE}"
+
+          echo "HEALTH_STATUS=${HEALTH_STATUS}"   >> "$GITHUB_ENV"
+          echo "HEALTH_HTTP=${HTTP_CODE}"         >> "$GITHUB_ENV"
+          echo "API_HTTP=${API_CODE}"             >> "$GITHUB_ENV"
+          echo "SWAGGER_HTTP=${SWAGGER_CODE}"     >> "$GITHUB_ENV"
+          echo "METRICS_HTTP=${METRICS_CODE}"     >> "$GITHUB_ENV"
+
+          if [ "${HEALTH_STATUS}" != "UP" ]; then
+            echo "::error::Application health is ${HEALTH_STATUS} — expected UP"
+            exit 1
+          fi
+
+          echo "All validation checks passed"
+
+      # ── 12. Write comprehensive GitHub Actions Job Summary ─────────────────
+      - name: Write Full Deployment Summary
+        if: always()
+        run: |
+          DEPLOY_STATUS="${{ job.status }}"
+          ICON="✅"; [ "$DEPLOY_STATUS" != "success" ] && ICON="❌"
+
+          httpicon() {
+            local code="$1"
+            [ "$code" = "200" ] && echo "✅ HTTP 200" || echo "❌ HTTP ${code}"
+          }
+
+          {
+            echo "# ${ICON} Production Deploy — KIND Cluster — ${DEPLOY_STATUS^^}"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 📋 Deploy Metadata"
+            echo ""
+            echo "| Detail                | Value |"
+            echo "|:----------------------|:------|"
+            echo "| **Commit**            | \`${{ github.sha }}\` |"
+            echo "| **Branch**            | \`${{ github.ref_name }}\` |"
+            echo "| **Image**             | \`${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\` |"
+            echo "| **Namespace**         | \`${{ env.K8S_NAMESPACE }}\` |"
+            echo "| **Rollout duration**  | ${ROLLOUT_ELAPSED:-n/a}s (limit: ${{ env.DEPLOY_TIMEOUT_SECONDS }}s) |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 🔐 Security Gate — Vulnerability Counts"
+            echo ""
+            echo "| Severity     | Count |"
+            echo "|:-------------|------:|"
+            echo "| 🔴 Critical  | **${{ needs.snyk-gate.outputs.critical }}** |"
+            echo "| 🟠 High      | **${{ needs.snyk-gate.outputs.high }}** |"
+            echo "| 🟡 Medium    | ${{ needs.snyk-gate.outputs.medium }} |"
+            echo "| 🔵 Low       | ${{ needs.snyk-gate.outputs.low }} |"
+            echo "| **Total**    | **${{ needs.snyk-gate.outputs.total }}** |"
+            echo "| **Gate**     | ${{ needs.snyk-gate.outputs.gate }} |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 🩺 Validation Results"
+            echo ""
+            echo "| Check                    | Result |"
+            echo "|:-------------------------|:-------|"
+            echo "| Actuator /health         | $(httpicon "${HEALTH_HTTP:-000}") |"
+            echo "| Health status            | \`${HEALTH_STATUS:-UNKNOWN}\` |"
+            echo "| /api/specialties (smoke) | $(httpicon "${API_HTTP:-000}") |"
+            echo "| Swagger UI               | $(httpicon "${SWAGGER_HTTP:-000}") |"
+            echo "| Prometheus /metrics      | $(httpicon "${METRICS_HTTP:-000}") |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 🐳 Pod Status"
+            echo ""
+            echo '```'
+            cat /tmp/pod-status.txt 2>/dev/null || echo "No pod status captured"
+            echo '```'
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 📜 Pod Logs (last 80 lines)"
+            echo ""
+            echo '```'
+            cat /tmp/pod-logs.txt 2>/dev/null || echo "No logs captured"
+            echo '```'
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 🔍 Actuator Health Response"
+            echo ""
+            echo '```json'
+            jq . /tmp/health.json 2>/dev/null || echo "No health response captured"
+            echo '```'
+            echo ""
+            echo "---"
+            echo ""
+            echo "## 📦 API Smoke Test Response (/api/specialties)"
+            echo ""
+            echo '```json'
+            jq . /tmp/api-response.json 2>/dev/null || echo "No API response captured"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 13. Teardown KIND cluster ──────────────────────────────────────────
+      - name: Teardown KIND cluster
+        if: always()
+        run: |
+          kind delete cluster --name petclinic-prod || true
+          echo "KIND cluster deleted"

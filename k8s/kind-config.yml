@@ -1,0 +1,12 @@
+# KIND cluster configuration
+# Exposes port 30966 on the host so the petclinic NodePort service
+# is reachable at http://localhost:9966 from the GitHub Actions runner.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: petclinic-prod
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30966   # maps to NodePort 30966 on the node
+        hostPort: 9966         # reachable at localhost:9966 on the runner
+        protocol: TCP

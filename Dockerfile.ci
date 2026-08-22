@@ -1,0 +1,35 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI Runtime Image — used by the GitHub Actions deploy pipeline only.
+#
+# The pipeline already compiles + tests the app in the `build` job and uploads
+# the fat JAR as an artifact.  This Dockerfile simply wraps that pre-built JAR
+# into a hardened JRE 21 runtime image — no Maven, no recompile.
+#
+# For local development builds that compile from source, use Dockerfile instead.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM eclipse-temurin:21-jre-alpine AS runtime
+
+# ── Security: dedicated non-root user/group ───────────────────────────────────
+RUN addgroup -S petclinic && adduser -S petclinic -G petclinic
+
+WORKDIR /app
+
+# ── Copy the pre-built fat JAR from the CI build artifact ─────────────────────
+# The pipeline downloads target/*.jar before running `docker build`,
+# so this path is available in the Docker build context.
+COPY --chown=petclinic:petclinic target/spring-petclinic-rest-*.jar app.jar
+
+USER petclinic
+
+EXPOSE 9966
+
+# ── Healthcheck — mirrors the K8s liveness probe ──────────────────────────────
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD wget -qO- http://localhost:9966/petclinic/actuator/health || exit 1
+
+# ── JVM flags tuned for container resource limits ─────────────────────────────
+ENTRYPOINT ["java", \
+  "-XX:+UseContainerSupport", \
+  "-XX:MaxRAMPercentage=75.0", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]
